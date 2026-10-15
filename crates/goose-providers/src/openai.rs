@@ -7,7 +7,7 @@ use super::retry::ProviderRetry;
 use crate::api_client::{AuthMethod, TlsConfig};
 use crate::conversation::message::Message;
 use crate::conversation::token_usage::{CostSource, ProviderUsage};
-use crate::declarative::{DeclarativeProviderConfig, KeyResolver};
+use crate::declarative::{DeclarativeProviderConfig, KeyResolver, ReasoningEffortMapping};
 use crate::errors::ProviderError;
 use crate::formats::openai::is_openai_responses_model;
 use crate::formats::openai::{
@@ -25,7 +25,6 @@ use crate::openai_compatible::{
     stream_responses_compat,
 };
 use crate::request_log::{start_log, LoggerHandleExt};
-use crate::thinking::ThinkingEffort;
 use anyhow::Result;
 use async_trait::async_trait;
 use reqwest::StatusCode;
@@ -139,6 +138,7 @@ pub struct OpenAiProvider {
     dynamic_models: Option<bool>,
     skip_canonical_filtering: bool,
     preserve_thinking_context: bool,
+    reasoning_effort_mapping: Option<ReasoningEffortMapping>,
     native_openai: bool,
     #[serde(skip)]
     session_id_provider: Option<OpenAiSessionIdProvider>,
@@ -172,6 +172,7 @@ pub struct OpenAiProviderBuilder {
     dynamic_models: Option<bool>,
     skip_canonical_filtering: bool,
     preserve_thinking_context: bool,
+    reasoning_effort_mapping: Option<ReasoningEffortMapping>,
     session_id_provider: Option<OpenAiSessionIdProvider>,
     native_openai: bool,
 }
@@ -190,6 +191,7 @@ impl OpenAiProviderBuilder {
             dynamic_models: None,
             skip_canonical_filtering: false,
             preserve_thinking_context: false,
+            reasoning_effort_mapping: None,
             session_id_provider: None,
             native_openai: false,
         }
@@ -268,6 +270,11 @@ impl OpenAiProviderBuilder {
         self
     }
 
+    pub fn reasoning_effort_mapping(mut self, mapping: Option<ReasoningEffortMapping>) -> Self {
+        self.reasoning_effort_mapping = mapping;
+        self
+    }
+
     pub fn native_openai(mut self, native_openai: bool) -> Self {
         self.native_openai = native_openai;
         self
@@ -286,6 +293,7 @@ impl OpenAiProviderBuilder {
             dynamic_models: self.dynamic_models,
             skip_canonical_filtering: self.skip_canonical_filtering,
             preserve_thinking_context: self.preserve_thinking_context,
+            reasoning_effort_mapping: self.reasoning_effort_mapping,
             session_id_provider: self.session_id_provider,
             native_openai: self.native_openai,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -418,6 +426,7 @@ impl OpenAiProvider {
             dynamic_models: None,
             skip_canonical_filtering: false,
             preserve_thinking_context: false,
+            reasoning_effort_mapping: None,
             session_id_provider: None,
             native_openai: false,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -488,28 +497,6 @@ impl OpenAiProvider {
     /// field to stream tool-call arguments incrementally.
     const PROVIDERS_NEEDING_TOOL_STREAM: &[&str] = &["zai_coding_plan"];
 
-    /// Providers whose reasoning models accept an OpenAI-style
-    /// `reasoning_effort` field on chat-completions requests but aren't
-    /// matched by [`is_openai_responses_model`] (which only recognises
-    /// OpenAI's own `o*`/`gpt-5*` model names). These need the unified
-    /// [`ThinkingEffort`] mapped onto the request explicitly.
-    const PROVIDERS_NEEDING_REASONING_EFFORT_MAPPING: &[&str] = &["meta"];
-
-    /// Maps the unified thinking effort onto Meta's Muse Spark
-    /// `reasoning_effort` levels: `low`, `medium`, `high`, `xhigh`.
-    ///
-    /// Muse Spark always reasons and has no supported "disable reasoning"
-    /// level, so `Off` is clamped to `low` (the lightest level Meta
-    /// supports) rather than sent as-is or omitted.
-    fn meta_reasoning_effort(effort: ThinkingEffort) -> &'static str {
-        match effort {
-            ThinkingEffort::Off | ThinkingEffort::Low => "low",
-            ThinkingEffort::Medium => "medium",
-            ThinkingEffort::High => "high",
-            ThinkingEffort::Max => "xhigh",
-        }
-    }
-
     fn declared_model(&self, model_name: &str) -> Option<&ModelInfo> {
         find_declared_model(self.custom_models.as_deref()?, model_name)
     }
@@ -557,13 +544,17 @@ impl OpenAiProvider {
                 }
             }
 
-            if Self::PROVIDERS_NEEDING_REASONING_EFFORT_MAPPING.contains(&self.name.as_str()) {
-                match model_config.thinking_effort() {
+            let mapping = self
+                .declared_model(&model_config.model_name)
+                .and_then(|model| model.reasoning_effort_mapping.as_ref())
+                .or(self.reasoning_effort_mapping.as_ref());
+            if let Some(mapping) = mapping {
+                let effort = model_config
+                    .thinking_effort()
+                    .and_then(|effort| mapping.get(&effort.to_string()));
+                match effort {
                     Some(effort) => {
-                        obj.insert(
-                            "reasoning_effort".to_string(),
-                            json!(Self::meta_reasoning_effort(effort)),
-                        );
+                        obj.insert("reasoning_effort".to_string(), json!(effort));
                     }
                     None => {
                         obj.remove("reasoning_effort");
@@ -1034,6 +1025,7 @@ pub fn from_declarative_config(
         .custom_models(custom_models)
         .dynamic_models(config.dynamic_models)
         .skip_canonical_filtering(config.skip_canonical_filtering)
+        .reasoning_effort_mapping(config.reasoning_effort_mapping)
         .preserve_thinking_context(config.preserves_thinking))
 }
 
@@ -1072,6 +1064,7 @@ fn ends_with_version_segment(path: &str) -> bool {
 mod tests {
     use super::*;
     use crate::api_client::AuthMethod;
+    use crate::thinking::ThinkingEffort;
     use serde_json::json;
 
     fn make_provider(name: &str) -> OpenAiProvider {
@@ -1092,10 +1085,21 @@ mod tests {
             dynamic_models: None,
             skip_canonical_filtering: false,
             preserve_thinking_context: false,
+            reasoning_effort_mapping: None,
             session_id_provider: None,
             native_openai: false,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn make_meta_provider() -> OpenAiProvider {
+        let config = crate::declarative::deserialize_provider_config(crate::meta::JSON).unwrap();
+        OpenAiProviderBuilder::new(
+            ApiClient::new_with_tls("http://localhost".into(), AuthMethod::NoAuth, None).unwrap(),
+        )
+        .name(config.name)
+        .reasoning_effort_mapping(config.reasoning_effort_mapping)
+        .build()
     }
 
     #[test]
@@ -1254,7 +1258,7 @@ mod tests {
 
     #[test]
     fn sanitize_meta_applies_reasoning_effort_from_thinking_effort() {
-        let provider = make_provider("meta");
+        let provider = make_meta_provider();
         let payload = json!({
             "model": "muse-spark-1.1",
             "messages": []
@@ -1270,7 +1274,7 @@ mod tests {
 
     #[test]
     fn sanitize_meta_maps_max_thinking_effort_to_xhigh() {
-        let provider = make_provider("meta");
+        let provider = make_meta_provider();
         let payload = json!({
             "model": "muse-spark-1.1",
             "messages": []
@@ -1289,7 +1293,7 @@ mod tests {
         // Muse Spark always reasons and has no "disable reasoning" level,
         // so an explicit `Off` must be clamped to the lightest supported
         // level rather than omitted or sent as-is.
-        let provider = make_provider("meta");
+        let provider = make_meta_provider();
         let payload = json!({
             "model": "muse-spark-1.1",
             "messages": [],
@@ -1306,7 +1310,7 @@ mod tests {
 
     #[test]
     fn sanitize_meta_omits_reasoning_effort_when_unset() {
-        let provider = make_provider("meta");
+        let provider = make_meta_provider();
         let payload = json!({
             "model": "muse-spark-1.1",
             "messages": []
@@ -1517,6 +1521,7 @@ mod tests {
             setup_steps: vec![],
             toolshim: false,
             preserves_thinking: false,
+            reasoning_effort_mapping: None,
             emit_clear_thinking: false,
             setup: None,
         }
@@ -1645,6 +1650,7 @@ mod tests {
             dynamic_models: Some(true),
             skip_canonical_filtering: false,
             preserve_thinking_context: false,
+            reasoning_effort_mapping: None,
             session_id_provider: None,
             native_openai: false,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
