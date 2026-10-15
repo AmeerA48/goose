@@ -325,6 +325,18 @@
     "type": "streamable-http"
   },
   {
+    "id": "schedulala",
+    "name": "Schedulala Social Media Scheduler",
+    "description": "Draft, preview, schedule and publish posts to 12 social platforms, reply to comments, and track analytics",
+    "url": "https://schedulala.com/api/mcp",
+    "link": "https://schedulala.com/developers/docs/mcp-tools",
+    "installation_notes": "Hosted remote server. Sign in with your Schedulala account via OAuth on first connect.",
+    "is_builtin": false,
+    "endorsed": false,
+    "environmentVariables": [],
+    "type": "streamable-http"
+  },
+  {
     "id": "github-mcp",
     "name": "GitHub",
     "description": "GitHub repository management and operations",
